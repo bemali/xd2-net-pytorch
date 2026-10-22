@@ -1,0 +1,44 @@
+# BPIC 2012 loan applications (data/BPIC_2012_OUTCOME.csv).
+# Kept comparable with the baseline pipeline: file event order, roles discovered
+# from RESOURCE, precomputed time features, no derived ones.
+
+name: bpic2012
+path: data/BPIC_2012_OUTCOME.csv
+
+columns:
+  caseid: CASEID
+  timestamp: END_TIMESTAMP
+  activity: MILESTONE
+  role: null                    # no role column: discover roles from resources
+  resource: RESOURCE
+role_discovery_clusters: 5
+event_order: file               # END_TIMESTAMP is not monotone within some cases; baseline uses file order
+
+event_cat: []
+event_num: [TASK_DURATION, TIME_ELAPSED]
+case_cat: []
+case_num: [AMOUNT_REQ]
+num_agg:
+  TIME_ELAPSED: max             # matches the baseline "Overall TIME_ELAPSED"
+
+outcome:
+  mode: column
+  column: OUTCOME
+  positive: A_APPROVED
+  labels: [A_DECLINED, A_APPROVED]
+
+time_features:
+  since_prev: false
+  since_start: false
+  hour: false
+  weekday: false
+
+norm:
+  default: max                  # baseline 'max' = z-score
+
+prefix:
+  lengths: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+  min_cases: 10
+
+test_split: 0.30
+balance_train: true

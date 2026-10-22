@@ -1,0 +1,65 @@
+# Dataset config template for scripts/run_experiment.py (shared by every model).
+# Copy to configs/datasets/<name>.yaml and edit. Unknown keys are rejected.
+
+name: my_log                      # used for the output folder and the results table
+path: data/my_log.csv             # .csv or .parquet
+
+# --- core columns (source names in your file) -------------------------------
+columns:
+  caseid: case_id
+  timestamp: timestamp
+  activity: activity
+  role: role                      # or null, and set `resource` to discover roles
+  resource: null                  #   (KMeans over activity profiles, fit on train)
+timestamp_format: null            # e.g. "%Y-%m-%d %H:%M:%S"; null lets pandas infer
+event_order: timestamp            # timestamp (stable sort, ties keep file order) | file
+role_discovery_clusters: 5
+
+# Activities removed before prefixing, e.g. terminal events that reveal the outcome.
+drop_activities: []
+
+# --- variables (explicit; nothing is guessed) --------------------------------
+# Case-level variables must be constant within a case (validated; see tolerance).
+event_cat: []                     # event-level categorical
+event_num: []                     # event-level numeric
+case_cat: []                      # case-level categorical  → static input + exp input
+case_num: []                      # case-level numeric      → static input + exp input
+case_level_tolerance: 0.0         # share of cases allowed to violate case-level constancy
+
+# Aggregation of numeric event fields in the explainable input
+# (mean | max | min | sum | last | first). Default: mean; TIME_SINCE_START: max.
+num_agg: {}
+
+# --- outcome (binary) ---------------------------------------------------------
+outcome:
+  mode: column                    # column | activity
+  column: outcome                 # column mode: constant-per-case outcome column
+  positive: "yes"                 # column mode: value that counts as positive
+  # activities: [Accepted]        # activity mode: positive if the case contains one;
+  #                               # that activity and everything after it are removed
+  labels: [negative, positive]    # display names [label for 0, label for 1]
+
+# --- derived time features ------------------------------------------------------
+time_features:
+  since_prev: true                # TIME_SINCE_PREV  (event numeric)
+  since_start: true               # TIME_SINCE_START (event numeric)
+  hour: false                     # HOUR    (event categorical)
+  weekday: false                  # WEEKDAY (event categorical)
+  unit: hours                     # seconds | minutes | hours | days
+
+# --- numeric normalisation (fit on train) ----------------------------------------
+norm:
+  default: max                    # max (z-score) | lognorm (log1p then z-score; values must be > -1)
+  overrides:
+    TIME_SINCE_PREV: lognorm
+
+# --- prefix buckets ---------------------------------------------------------------
+prefix:
+  lengths: auto                   # auto, or an explicit list such as [3, 5, 10]
+  min_len: 2                      # auto: min_len .. min(max_len, quantile of train case length)
+  max_len: 20
+  quantile: 0.9
+  min_cases: 10                   # buckets with fewer train cases are skipped
+
+test_split: 0.30
+balance_train: true               # undersample the majority class in each train bucket

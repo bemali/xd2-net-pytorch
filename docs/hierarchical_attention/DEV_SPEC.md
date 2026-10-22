@@ -1,405 +1,424 @@
 # Hierarchical Self-Attention XD2-Net — Development Spec
 
-Status: ready for implementation · Branch: `feattransformer-self-attention-exp`
+Status: implemented · Branch: `feattransformer-self-attention-exp`
 Rationale and math: [`APPROACH.md`](APPROACH.md)
 
 ---
 
 ## 1. Scope
 
-**In scope**
-* New subpackage `xd2net/hierarchical/` that implements the two-level self-attention encoder,
-  value-aware tokenization, attention extraction, and hierarchical explanation outputs.
-* New config dataclass, experiment script, notebook, and tests for the variant.
-
-**Out of scope / constraints**
-* **No modification** of baseline modules: `xd2net/model/*`, `xd2net/explain/explainer.py`,
-  `xd2net/training/*`, `xd2net/data/*`, `xd2net/config.py`. They may be *imported* and
-  subclassed, not edited.
-* The Level-2 explainer refactor in `xd2net/explainer_edits.md` is separate work. This spec must
-  stay compatible with it (it does, because the heads are unchanged).
+* `xd2net/hierarchical/` implements:
+  * the two-level self-attention model;
+  * value-aware tokenization;
+  * attention extraction;
+  * hierarchical explanations.
+* `xd2net/common/` holds what both variants share:
+  * the **dataset-agnostic event-log pipeline**, so the same model/training settings run on many
+    logs;
+  * the Trainer, the Explainer base, the Level-2 heads and the model registry.
+* `xd2net/baseline/` is the original Transformer + TemporalAttentionPool model. It has the same
+  module set as `hierarchical/` and runs on the same pipeline.
+* The issues found in the original baseline code are fixed (§13).
+* Level-2 (ThetaHead / PredictionHead) is unchanged. The work in `docs/explainer_edits.md`
+  applies to `common/explainer.py`.
 
 ---
 
 ## 2. File layout
 
 ```
-xd2net/hierarchical/
-├── __init__.py          exports XD2NetHier, HierModelConfig, TokenSchema, HierExplainer
-├── config.py            HierModelConfig, HierConfig, load_hier_config()
-├── data.py              TokenSchema, build_token_schema(), build_dynamic_tokens()
-├── layers.py            AttnEncoderLayer, AttnEncoder, cls_readout(), attention_rollout()
-├── tokenizer.py         FieldTokenizer
-├── model.py             EventLevelEncoder, CaseLevelEncoder, HierOutput, XD2NetHier
-└── explainer.py         HierExplainer(Explainer)
-configs/bpic2012_hier.yaml
-scripts/run_hier_experiment.py
-notebooks/05_hier_explain.ipynb
-tests/hierarchical/
-├── test_data.py
-├── test_layers.py
-├── test_model.py
-└── test_explainer.py
+xd2net/common/
+├── config.py        TrainingConfig, ExperimentConfig, DatasetConfig (+ ColumnsConfig, OutcomeConfig,
+│                    TimeFeatureConfig, NormConfig, PrefixConfig), load_experiment_config(path, model_cfg_cls),
+│                    load_dataset_config, save_yaml
+├── data/
+│   ├── eventlog.py      load_event_log(): read, rename, sort, type, drop, time features, outcome,
+│   │                    case-level validation
+│   ├── preprocessing.py split_train_test, RoleDiscovery, create_index, normalize_events,
+│   │                    extract_prefixes, balance_dataset, reformat_events, vectorize, trace_stats
+│   ├── features.py      EventSchema, build_event_schema(), build_static_input(), build_exp_input()
+│   ├── pipeline.py      PreparedLog, prepare_dataset(), resolve_prefix_lengths(), build_bucket()
+│   └── dataset.py       EventLogDataset, make_dataloaders, make_test_loader
+├── heads.py         ThetaHead, PredictionHead
+├── masks.py         make_padding_mask
+├── metrics.py       evaluate_predictions, feature_agreement
+├── training.py      Trainer (+ `_l2_penalty` hook)
+├── explainer.py     Explainer (Level-2 tables, attention-cell table, global summaries)
+└── registry.py      ModelSpec, available_models(), get_spec(name)
+xd2net/hierarchical/                     xd2net/baseline/
+├── config.py        HierModelConfig      ├── config.py        BaselineModelConfig
+├── data/features.py build_dynamic_tokens ├── data/features.py build_dynamic_onehot, dynamic_feature_names
+├── layers.py        AttnEncoder(Layer),  ├── layers.py        InputProjection, EventEncoder,
+│                    cls_attn_mask,       │                    TemporalAttentionPool,
+│                    attention_rollout,   │                    FeatureWeightingBlock
+│                    cls_readout          │
+├── tokenizer.py     FieldTokenizer       │
+├── model.py         XD2NetHier, HierOutput ├── model.py      XD2Net
+├── training.py      HierTrainer          ├── training.py      BaselineTrainer
+├── explainer.py     HierExplainer        ├── explainer.py     BaselineExplainer
+└── spec.py          SPEC                 └── spec.py          SPEC
+configs/models/{baseline,hierarchical}.yaml   model + training settings per variant
+configs/datasets/bpic2012.yaml                BPIC 2012
+configs/datasets/_template.yaml               annotated template for new logs
+scripts/run_experiment.py                     multi-model, multi-dataset runner
+notebooks/01–04                               per-(MODEL, DATASET_CONFIG) prepare/train/evaluate/explain
+notebooks/05_hier_explain.ipynb               visualisation of hierarchical runner outputs
+tests/  conftest.py, synthetic.py, test_registry.py, common/, baseline/, hierarchical/
 ```
 
-Reused from the baseline without changes: `ThetaHead`, `PredictionHead`
-(`xd2net/model/heads.py`), `make_padding_mask` (`xd2net/model/encoder.py`), `EventLogDataset`,
-`make_dataloaders`, `make_test_loader` (`xd2net/data/dataset.py`), `Trainer`
-(`xd2net/training/trainer.py`), `Explainer` (`xd2net/explain/explainer.py`), and all of
-`xd2net/data/preprocessing.py` plus the `input_exp` / static builders in `feature_engineering.py`.
+**Plug-in contract (`ModelSpec`).** A variant provides:
+* a model config class;
+* a model class with `get_config()` / `from_config()` and the forward
+  `(raw_input, static, exp, lengths) -> (thetas, prob, alpha)`, with its regularised parameters
+  under `model.encoder`;
+* `encode_dynamic(vec, schema, max_len) -> input_dynamic`, the only data step that differs;
+* `build_model(bucket, cfg, dataset_name)`;
+* a trainer class and an explainer class;
+* the path of its default config.
 
 ---
 
-## 3. Configuration — `xd2net/hierarchical/config.py`
+## 3. Configuration
 
-```python
-@dataclass
-class HierModelConfig:
-    d_model: int = 64
-    nhead: int = 4                    # must divide d_model
-    event_layers: int = 1             # Level A depth
-    case_layers: int = 1              # Level B depth
-    dim_feedforward_mult: int = 4
-    dropout: float = 0.15
-    attn_readout: str = "rollout"     # "rollout" | "last"  (identical when layers == 1)
-    dense_1_mult: float = 1.5         # ThetaHead
-    l2_reg: float = 0.0001            # applied by Trainer to model.encoder params
+### 3.1 Model config (one per variant, shared by every dataset) — `configs/models/<model>.yaml`
 
-@dataclass
-class HierConfig:
-    data: DataConfig                  # reused from xd2net.config
-    model: HierModelConfig
-    training: TrainingConfig          # reused
-    output: OutputConfig              # reused
-
-def load_hier_config(path: str) -> HierConfig: ...
+```yaml
+# configs/models/hierarchical.yaml
+model:     {d_model: 64, nhead: 4, event_layers: 1, case_layers: 1, dim_feedforward_mult: 4,
+            dropout: 0.15, attn_readout: rollout, cls_self_attend: false, dense_1_mult: 1.5}
+training:  {optimizer: Adam, learning_rate: 0.01, batch_size: 256, epochs: 100, val_split: 0.15,
+            early_stopping_patience: 10, lr_reduce_patience: 10, lr_reduce_factor: 0.5,
+            lr_min: 1.0e-7, l2_reg: 0.0001, save_checkpoints: true, seed: 42, device: auto}
+workspace_dir: ./outputs
+# configs/models/baseline.yaml
+model:     {d_model: 140, nhead: 4, num_encoder_layers: 1, dim_feedforward_mult: 4,
+            dropout: 0.15, dense_1_mult: 1.5}
+training:  {... same keys ...}
 ```
 
-* `load_hier_config` reuses `xd2net.config._from_dict`.
-* Validation in `__post_init__`: `d_model % nhead == 0`, `attn_readout in {"rollout","last"}`,
-  layers ≥ 1.
-* `configs/bpic2012_hier.yaml` = `configs/bpic2012.yaml` with the `model:` block replaced by the
-  fields above. Set `output.workspace_dir: ./outputs_hier` so results never overwrite baseline
-  outputs.
+* `TrainingConfig` defines `l2_reg`, `save_checkpoints` and `seed`. `l2_reg` moved there from the
+  baseline model config.
+* `load_experiment_config(path, spec.model_config_cls)`: the variant's dataclass validates the
+  `model` section, so unknown keys are rejected.
+* Validation:
+  * hierarchical: `d_model % nhead == 0`, `attn_readout ∈ {rollout, last}`, layers ≥ 1;
+  * baseline: `d_model % nhead == 0`, layers ≥ 1.
 
-> Note: `d_model` defaults to 64 rather than 140 because Level A only sees 5 tokens. Treat it as a
-> tunable hyperparameter.
+### 3.2 Dataset config (one per event log) — see `configs/datasets/_template.yaml`
+
+| Key | Meaning |
+|---|---|
+| `name`, `path` | output folder name; `.csv` or `.parquet` |
+| `columns.{caseid,timestamp,activity}` | source column names |
+| `columns.role` / `columns.resource` | a role column, **or** `role: null` + `resource` (roles discovered by KMeans, fit on train) |
+| `timestamp_format`, `event_order` | parsing format; `timestamp` (stable sort, ties keep file order) or `file` |
+| `drop_activities` | activities removed before prefixing (outcome-revealing terminal events) |
+| `event_cat`, `event_num`, `case_cat`, `case_num` | **explicit** variable levels (nothing is inferred) |
+| `case_level_tolerance` | share of cases allowed to violate case-level constancy (default 0) |
+| `num_agg` | exp-input aggregation per numeric event field (`mean` default, `TIME_SINCE_START: max`) |
+| `outcome` | `{mode: column, column, positive, labels}` or `{mode: activity, activities, labels}` |
+| `time_features` | `since_prev`, `since_start` (numeric), `hour`, `weekday` (categorical), `unit` |
+| `norm` | `default` (`max` = z-score, or `lognorm`) and per-field `overrides` |
+| `prefix` | `lengths: auto` or a list; `min_len`, `max_len`, `quantile`, `min_cases` |
+| `test_split`, `balance_train` | as in the baseline |
+
+* Unknown keys raise an error, so typos are caught.
+* Reserved names (`CASEID`, `ACTIVITY`, `ROLE`, `TIME_SINCE_*`, …) cannot be used as variable
+  names.
+* Event field order in the model: `[ACTIVITY, ROLE, *event_cat, (HOUR), (WEEKDAY)]` followed by
+  `[*event_num, (TIME_SINCE_PREV), (TIME_SINCE_START)]`.
 
 ---
 
-## 4. Data — `xd2net/hierarchical/data.py`
+## 4. Data pipeline — `xd2net/common/data/` (shared by both variants)
 
-### 4.1 `TokenSchema`
+### 4.1 `load_event_log(ds, df=None)`
+1. Select the configured columns only, then rename them to `CASEID, TIMESTAMP, ACTIVITY, ROLE |
+   RESOURCE` (outcome column → internal `_OUTCOME_RAW`). Missing columns raise and list the
+   available ones.
+2. Parse timestamps. Unparseable rows are dropped with a warning. `CASEID` is cast to `str`. Rows
+   are sorted per `event_order` with a mergesort (stable).
+3. Categoricals: NaN or empty → `"none"`, then `str`. Numerics: `to_numeric(errors="coerce")`,
+   with coerced values logged.
+4. Drop `drop_activities`, then derive time features.
+5. Outcome:
+   * `column`: the per-case value must be constant (within tolerance). Positive = equal to
+     `positive`, compared both as raw values and as strings.
+   * `activity`: positive = the case contains a target activity. The first target occurrence and
+     everything after it are removed. Cases left empty are dropped.
+   * In both modes `OUTCOME` is the label string, so the baseline `extract_prefixes` and
+     `balance_dataset` work. A single resulting class raises.
+6. Case-level validation: `nunique` per case for each `case_*` variable. If the share of cases
+   that vary exceeds the tolerance, raise with examples. Otherwise broadcast the first non-null
+   value per case.
+7. `ACTIVITY_INDEX = cumcount + 1`.
 
-```python
-@dataclass(frozen=True)
-class TokenSchema:
-    cat_fields: List[str]                    # e.g. ["ACTIVITY", "ROLE"]
-    num_fields: List[str]                    # e.g. ["TASK_DURATION", "TIME_ELAPSED"]
-    cardinalities: List[int]                 # per cat field, EXCLUDING pad (embedding size = card+1)
-    index_to_label: Dict[str, Dict[int, str]]  # per cat field, shifted index (≥1) → label
+### 4.2 `prepare_dataset(ds, seed, df=None) -> PreparedLog`
+* `split_train_test`.
+* Roles: use the role column, or apply `RoleDiscovery` fit (train) / transform (test). That needs
+  a `MILESTONE` alias.
+  * KMeans runs on binary resource × activity profiles of train resources.
+  * On any frame, seen resources keep their train role. Missing and unseen resources get
+    `"none"`.
+  * No events are dropped.
+  * Integer-valued float ids (from a column with NaN) match their int form.
+* Numeric imputation with train medians. Normalisation is grouped by method, calling
+  `normalize_events` once per group (train fit, test transform).
+* Categorical indexes from train with `create_index(reserve_zero=True)`. Unseen and missing
+  values map to 0 = `"none"`.
+* `PreparedLog.summary()` gives a JSON description (fields, cardinalities, case-length
+  quantiles).
 
-    @property
-    def n_cat(self) -> int
-    @property
-    def n_num(self) -> int
-    @property
-    def field_names(self) -> List[str]       # cat_fields + num_fields  (packed column order)
-    @property
-    def n_fields(self) -> int
+### 4.3 `resolve_prefix_lengths(prepared)`
+An explicit list, or `auto` = `range(min_len, min(max_len, quantile(train case lengths)) + 1)`.
 
-    def to_dict(self) -> dict / @classmethod from_dict(d) -> TokenSchema   # JSON-serialisable
-```
+### 4.4 `build_bucket(prepared, n, encode_dynamic, seed) -> dict | None`
+* `extract_prefixes`. The bucket is skipped if there are fewer than `min_cases` train cases, no
+  test cases, or a single train class.
+* Balancing: `balance_dataset` always undersamples the **actual minority label**. It used to take
+  the positive label, which breaks when positive is the majority class.
+* `reformat_events` (sequences reversed, most recent event first) → `trace_stats` → `vectorize`.
+* Inputs:
+  * `encode_dynamic` (variant-specific):
+    * hierarchical `build_dynamic_tokens`: packed `(N, T, n_cat + n_num)`, category index + 1,
+      0 = PAD at `t ≥ length`.
+    * baseline `build_dynamic_onehot`: `(N, T, Σ cardinalities + n_num)`, all-zero rows at
+      `t ≥ length`.
+  * `build_static_input`.
+  * Generic `build_exp_input`: categorical counts per label with **padding excluded**
+    (`"Occurrence of F=label"`); numeric aggregations (`"Mean F"`, `"Max F"`, …); then static
+    fields.
+* Train and test share the same indexes, so the feature names always match. The old
+  `align_exp_dims` zero-padding is gone.
+* Returns: `bucket_key`, `inputs_/outputs_/lengths_/caseids_{train,test}`, `exp_dim`, `max_len`,
+  `feature_names`, `dim_dynamic`, `dim_static`, `event_schema`, `n_train`, `n_test` and
+  `dataset`.
+* Everything except `inputs_*["input_dynamic"]` / `dim_dynamic` is identical across variants
+  (tested).
 
-### 4.2 Builders
-
-```python
-def build_token_schema(indexes: Dict, cat_dynamic: List[str], num_dynamic: List[str]) -> TokenSchema
-```
-* `cardinalities[i] = len(indexes["dynamic_indexes"][f"{feat}_index"])`.
-* `index_to_label[feat] = {orig_idx + 1: label for label, orig_idx in index.items()}`.
-
-```python
-def build_dynamic_tokens(vec: dict, schema: TokenSchema, max_len: int, lengths: np.ndarray) -> np.ndarray
-```
-* Returns float32 `(N, max_len, n_cat + n_num)`.
-* Columns `[0, n_cat)`: `vec["prefixes"][feat][:, :max_len] + 1`, then **set to 0 at every
-  position `t ≥ lengths[i]`** (PAD). Use `lengths`, not the value 0, because 0 is a valid original
-  index.
-* Columns `[n_cat, n_cat+n_num)`: `vec["prefixes"][feat][:, :max_len]` (already normalised; zero
-  at padding).
-* The result goes into `inputs["input_dynamic"]` in place of the one-hot tensor. Everything else
-  in the bucket dict (`input_static`, `input_exp`, `lengths`, `caseid`, `feature_names`) is built
-  with the existing functions.
-
-### 4.3 Invariants (asserted in the builder)
-* Category columns hold integers in `[0, card]`; value 0 appears **only** at padded positions.
-* `max(index) < 2**24` (exact float32 representation).
+### 4.5 `EventSchema` (`common/data/features.py`)
+`cat_fields`, `num_fields`, `cardinalities` (excluding PAD), `index_to_label` (shifted index →
+label). It has `to_dict` / `from_dict` for JSON. Packed token indices must be `< 2²⁴` (exact in
+float32). Both models store it (`model.schema`), so the explainer can decode event values.
 
 ---
 
 ## 5. Layers — `xd2net/hierarchical/layers.py`
 
-### 5.1 `AttnEncoderLayer`
-A pre-norm Transformer encoder layer that **returns attention weights**.
-`nn.TransformerEncoderLayer` calls MHA with `need_weights=False`, so it cannot be used.
+* `AttnEncoderLayer`: pre-norm MHA (`need_weights=True, average_attn_weights=False`) + GELU FFN.
+  Takes `key_padding_mask` and `attn_mask`. Returns `(out, attn (N,H,L,L))`.
+* `AttnEncoder`: a stack of layers plus a final LayerNorm. Returns `(out, [attn per layer])`.
+* `cls_attn_mask(L, cls_self_attend)`: an `(L, L)` bool mask blocking the CLS→CLS cell, or
+  `None` when self-attention is allowed.
+* `attention_rollout(attns)`: `Â = 0.5·mean_h(A) + 0.5·I`, row-normalised; `R = Â_L ⋯ Â_1`.
+* `cls_readout(attns, mode, token_mask)`:
+  * Row 0 from `last` (head mean) or `rollout`.
+  * Drop column 0, zero the padded tokens, renormalise.
+  * `self_mass` = raw last-layer head-mean `A[0,0]`. It is never taken from rollout, because the
+    identity term would make it ≥ 0.5.
 
-```python
-class AttnEncoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout): ...
-        # norm1, self_attn = nn.MultiheadAttention(d_model, nhead, dropout, batch_first=True),
-        # norm2, ff = Linear→GELU→Dropout→Linear, dropout1, dropout2
-    def forward(self, x: Tensor, key_padding_mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
-        """x: (N, L, d) → (out (N, L, d), attn (N, H, L, L))"""
-        h = self.norm1(x)
-        a, w = self.self_attn(h, h, h, key_padding_mask=key_padding_mask,
-                              need_weights=True, average_attn_weights=False)
-        x = x + self.dropout1(a)
-        x = x + self.dropout2(self.ff(self.norm2(x)))
-        return x, w
+## 6. Tokenizer — `FieldTokenizer(schema, d_model)`
+* Categorical token: `E_field[f] + E_val_f[v]` (`padding_idx=0`).
+* Numeric token: `E_field[f] + x·w_f + b_f`.
+* Shape: `(B, T, n_cat+n_num) → (B, T, F, d)`.
+
+## 7. Model — `XD2NetHier(schema, dim_static, exp_dim, max_len, cfg, dataset_name)`
+
+* `encoder = ModuleDict(tokenizer, event, case)`. Every encoder parameter lives here.
+* **Level A** `EventLevelEncoder`: `(B·T, 1+F, d)` with `[EVT]`. No padding mask, because padded
+  events are discarded later. CLS self-cell masked by default. Outputs: event rep, β, and the
+  `[EVT]` self-mass.
+* **Level B** `CaseLevelEncoder`: event reps + position embedding (zeroed at padding) +
+  `[CASE]`. Key-padding mask, CLS self-cell masked by default. Outputs: case rep, α, and the
+  `[CASE]` self-mass.
+* `ThetaHead(d_model + dim_static)` and `PredictionHead(exp_dim)` from the baseline.
+* `forward(raw_input, static, exp, lengths=None, return_attn=False)`:
+  * default → `(thetas, prob, alpha)`, compatible with the baseline Trainer/Explainer;
+  * `return_attn=True` → `HierOutput(thetas, act_output, alpha, beta, joint, evt_self_attn,
+    case_self_attn, event_attn_raw, case_attn_raw)`. β and evt_self are zeroed at padded events.
+* `get_config()` / `from_config()` rebuild the module from JSON plus a state_dict.
+
+## 8. Trainer — `common.training.Trainer` + `HierTrainer` / `BaselineTrainer`
+
+The shared `Trainer` provides:
+* the train loop and validation (AUC);
+* `ReduceLROnPlateau`;
+* early stopping;
+* `_save_checkpoint`, which keeps only the current best file;
+* `load_best_model`, with `weights_only=True`. When checkpoints are off, it restores an in-memory
+  copy of the best state.
+
+The L2 term is `cfg.l2_reg * _l2_penalty()`:
+* `Trainer._l2_penalty` (used by `BaselineTrainer`): every `model.encoder` parameter, as in the
+  original.
+* `HierTrainer._l2_penalty`: **excludes attention W_q/W_k, LayerNorm parameters and biases**.
+  Full L2 collapsed attention to uniform (APPROACH §4.3b).
+
+## 9. Explainer — `common.explainer.Explainer` + `HierExplainer` / `BaselineExplainer`
+
+* Shared:
+  * `explain_loader` / `global_explanation` (Level-2) — vectorised, same output as before;
+  * `get_temporal_attention`;
+  * `explain_attention_loader`;
+  * the static `global_attention`.
+* Variant hooks:
+  * `_attention_batch` returns α and, if the model has them, β and the self-masses (otherwise
+    `None` → NaN columns).
+  * `_decode_events` turns dynamic-input rows into shifted indices / values:
+    * hierarchical: identity;
+    * baseline: argmax per one-hot block + 1, numerics as is.
+* `HierExplainer.get_hierarchical_attention(...) -> {alpha, beta, joint, evt_self_attn, case_self_attn}`.
+* `explain_attention_loader(loader, caseids, bucket) -> (df_cells, df_case_fields)`. The schema
+  comes from `model.schema`.
+  * **df_cells**: one row per (case, real event, field):
+    `CASEID, EVENT_POS (0 = most recent), EVENT_INDEX (0 = first), EVENT_ACTIVITY, EVENT_ROLE,
+    FIELD, VALUE_LABEL, VALUE_NUM, EVENT_ATTN (α), FEATURE_ATTN (β), JOINT_ATTN (α·β),
+    EVT_SELF_ATTN, BUCKET`.
+    Rows are ordered by loader case order, then chronological event, then schema field order.
+  * **df_case_fields**: `CASEID, FIELD, CASE_FIELD_ATTN (Σ_t α·β), CASE_SELF_ATTN, BUCKET`.
+  * Raises on a caseid-count or field-count mismatch. Warns on a non-sequential loader.
+  * Baseline: β, joint and self-mass columns are NaN. α comes from the TemporalAttentionPool.
+* `global_attention(df_cells, by="field" | "field_label")`: mean per-case attention (absent
+  counts as 0) plus `N_CASES`. Only meaningful when `JOINT_ATTN` is present.
+
+## 10. Runner — `scripts/run_experiment.py`
+
 ```
-* Attention dropout applies to `w` before it multiplies V. The **returned** `w` is the
-  post-softmax, pre-dropout distribution in eval mode (PyTorch returns pre-dropout weights).
-  Explanations are always extracted in `eval()` mode.
-
-### 5.2 `AttnEncoder`
-```python
-class AttnEncoder(nn.Module):
-    def __init__(self, d_model, nhead, num_layers, dim_feedforward, dropout): ...
-        # layers: ModuleList[AttnEncoderLayer], final_norm: LayerNorm
-    def forward(self, x, key_padding_mask=None) -> Tuple[Tensor, List[Tensor]]:
-        """returns (final_norm(x), [attn_l  (N,H,L,L) for each layer])"""
+python scripts/run_experiment.py --model baseline hierarchical \
+    --datasets configs/datasets/a.yaml configs/datasets/b.yaml \
+    [--model-config m1.yaml m2.yaml] [--buckets 1_5 1_10] [--seed 42] [--epochs N] \
+    [--workspace DIR] [--fail-fast]
 ```
+* `--model-config` defaults to `configs/models/<model>.yaml`. `--seed` / `--epochs` override
+  every model's training config. The workspace and the data seed come from the first model
+  unless `--workspace` / `--seed` are given.
+* For each dataset:
+  * `prepare_dataset` runs **once** and is shared by all models.
+  * Under `<workspace>/<model>/<dataset>/`, save `dataset_config.yaml`, `experiment_config.yaml`
+    and `dataset_summary.json` (including the resolved prefix lengths).
+  * For each bucket and each model:
+    * `build_bucket(..., spec.encode_dynamic)`, seed, `spec.build_model`, `spec.trainer_cls`;
+    * best checkpoint plus `model_config_<bucket>.json`;
+    * `predictions_` / `explanations_` (Level-2);
+    * `attention_cells_` / `attention_case_fields_` (Level-1), plus `attention_global_` when β
+      exists;
+    * metrics.
+* Per-(model, dataset) `results.csv` and a combined `<workspace>/results_all.csv` (`model,
+  dataset, bucket, n_train, n_test, epochs, accuracy, precision, recall, f1, roc_auc`).
+* Metrics are NaN when the test bucket has a single class. A failing dataset is logged and the
+  runner continues, unless `--fail-fast` is given.
 
-### 5.3 Readout helpers
-```python
-def attention_rollout(attns: List[Tensor]) -> Tensor:
-    """attns: list of (N,H,L,L). Head-mean, add identity: Â = 0.5·mean_h(A) + 0.5·I,
-    row-normalise, R = Â_L @ … @ Â_1. Returns R (N,L,L)."""
+## 11. Notebooks
 
-def cls_readout(attns: List[Tensor], mode: str,
-                token_mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
-    """Return (weights (N, L-1), self_mass (N,)).
-    mode="last":    row = mean_h(attns[-1])[:, 0, :]
-    mode="rollout": row = attention_rollout(attns)[:, 0, :]
-    self_mass = row[:, 0]; w = row[:, 1:]
-    if token_mask is not None (True = pad): w = w.masked_fill(token_mask, 0)
-    w = w / w.sum(-1, keepdim=True).clamp_min(1e-12)"""
-```
+* **01–04:**
+  * Parameters `MODEL`, `DATASET_CONFIG`, `MODEL_CONFIG`.
+  * 01 runs `prepare_dataset` + `build_bucket` and pickles the buckets to
+    `<workspace>/<MODEL>/<dataset>/artifacts/`.
+  * 02 trains via the spec and writes the checkpoint + `model_config_<bucket>.json`.
+  * 03 and 04 rebuild models with `spec.model_cls.from_config`.
+* **05 (`05_hier_explain.ipynb`)** reads runner outputs. Parameters: `WORKSPACE`, `MODEL`,
+  `DATASET`, `BUCKET`, `CASE_ID`. It shows:
+* AUC per bucket per (model, dataset), and a side-by-side AUC table of the models for the
+  selected dataset;
+* a per-case T×F joint heatmap with label annotations, next to α;
+* the β table;
+* global attention by field and by (field, label);
+* α by event index;
+* diagnostics: normalised entropy of α/β (≈ 1 everywhere = collapsed attention) and CLS
+  self-mass;
+* Level-2 theta importances.
 
----
+## 12. Tests — `pytest tests -q`
 
-## 6. Tokenizer — `xd2net/hierarchical/tokenizer.py`
+Layout: `tests/common/` (data, fixes), `tests/baseline/`, `tests/hierarchical/` and
+`tests/test_registry.py`.
 
-```python
-class FieldTokenizer(nn.Module):
-    def __init__(self, schema: TokenSchema, d_model: int): ...
-        # field_emb:   nn.Embedding(n_fields, d_model)
-        # val_emb:     nn.ModuleList([nn.Embedding(card+1, d_model, padding_idx=0) for card in cardinalities])
-        # num_w, num_b: nn.Parameter(n_num, d_model) each  (init normal std=0.02 / zeros)
-    def forward(self, packed: Tensor) -> Tensor:
-        """packed (B, T, n_cat+n_num) float → tokens (B, T, n_fields, d_model)
-        cat:  val_emb[i](packed[..., i].long())
-        num:  packed[..., n_cat+j, None] * num_w[j] + num_b[j]
-        tokens = stack([...], dim=2) + field_emb.weight  (broadcast over B,T)"""
-```
+* **Registry** (for every model):
+  * synthetic bucket → model → 1 epoch → `from_config` round-trip → Level-2 and attention-cell
+    tables (fixed column schema, α sums to 1);
+  * both models get identical buckets apart from `input_dynamic`.
+* **Fixed issues** (`tests/common/test_fixes.py`):
+  * RoleDiscovery keeps every event, maps NaN/unseen to `none` and handles numeric/float ids;
+  * actual-minority balancing;
+  * padding-free counts;
+  * only the best checkpoint is kept, loaded with `weights_only`;
+  * in-memory best state when checkpoints are off;
+  * seeded shuffle;
+  * the `TrainingConfig` fields.
+* **Baseline:**
+  * one-hot layout with zero padded rows;
+  * shapes;
+  * α sums to 1 and is 0 on padding;
+  * mask invariance;
+  * config round-trip;
+  * trainer + single checkpoint;
+  * L2 over all encoder parameters.
+* **Data:**
+  * config validation (unknown keys, reserved/duplicate names, field order);
+  * sorting with ties and `event_order: file`;
+  * time features;
+  * missing values and coercion;
+  * column outcome; `drop_activities`; activity outcome with the leakage cut;
+  * case-level validation and tolerance;
+  * missing-column error; single-class error;
+  * unseen labels → `none`; imputation; role discovery path;
+  * auto prefix lengths;
+  * bucket shapes and balancing; bucket skipping;
+  * token shift/PAD; schema round-trip;
+  * exp-input padding exclusion and all aggregations;
+  * every shipped config parses.
+* **Layers:**
+  * per-head attention shape and row sums;
+  * the CLS mask zeroes the self cell;
+  * head-mean readout;
+  * rollout == last for 1 layer; rollout row sums;
+  * the token mask.
+* **Model:**
+  * output types and shapes;
+  * β/α/joint normalisation and zeros on padding;
+  * self-mass 0 by default; the `cls_self_attend` option;
+  * **mask invariance** (extra junk padding leaves prob/α/β unchanged) for rollout/last at
+    depths 1–3;
+  * batch size 1 and `lengths=None`;
+  * parameter ownership under `encoder`;
+  * config round-trip;
+  * trainer run plus checkpoint;
+  * the L2 penalty skips Q/K/LayerNorm but includes V.
+* **Explainer:**
+  * row counts;
+  * per-case and per-event sums;
+  * the EVENT_POS/EVENT_INDEX relation;
+  * labels vs values; activity column consistency;
+  * case order;
+  * global sums;
+  * caseid mismatch error;
+  * inherited Level-2 output schema.
 
----
+`tests/synthetic.py` generates a log with non-standard column names, case- and event-level
+variables, and both outcome encodings. Run as a script, it writes a CSV and a dataset YAML for
+smoke runs.
 
-## 7. Model — `xd2net/hierarchical/model.py`
+## 13. Baseline issues (fixed in the restructure)
 
-### 7.1 Level encoders
-```python
-class EventLevelEncoder(nn.Module):        # Level A
-    # evt_token: Parameter(1,1,d); encoder: AttnEncoder(event_layers)
-    def forward(self, tokens: Tensor, readout: str) -> Tuple[Tensor, Tensor, Tensor, List[Tensor]]:
-        """tokens (B,T,F,d) → reshape (B·T,F,d) → prepend [EVT] → (B·T,1+F,d)
-        → AttnEncoder (no mask) → evt_rep = out[:,0]  reshape (B,T,d)
-        beta, evt_self = cls_readout(attns, readout)   reshape (B,T,F), (B,T)
-        returns (evt_rep, beta, evt_self, attns)"""
-
-class CaseLevelEncoder(nn.Module):         # Level B
-    # case_token: Parameter(1,1,d); pos_emb: nn.Embedding(max_len, d); encoder: AttnEncoder(case_layers)
-    def forward(self, evt_rep, pad_mask, readout) -> Tuple[Tensor, Tensor, Tensor, List[Tensor]]:
-        """x = evt_rep + pos_emb(arange(T))   (pos zeroed at pad, as baseline InputProjection)
-        prepend [CASE] → (B,1+T,d); kpm = cat([False], pad_mask) (B,1+T)
-        → AttnEncoder(kpm) → case_rep = out[:,0] (B,d)
-        alpha, case_self = cls_readout(attns, readout, token_mask=pad_mask)
-        returns (case_rep, alpha, case_self, attns)"""
-```
-
-### 7.2 Output container
-```python
-class HierOutput(NamedTuple):
-    thetas: Tensor           # (B, exp_dim)
-    act_output: Tensor       # (B,)   probabilities
-    alpha: Tensor            # (B, T)    case → event, 0 at pad, sums to 1
-    beta: Tensor             # (B, T, F) event → field, 0 at pad events, sums to 1 per real event
-    joint: Tensor            # (B, T, F) alpha[...,None] * beta, sums to 1 per case
-    evt_self_attn: Tensor    # (B, T)   [EVT] self-mass (diagnostic), 0 at pad
-    case_self_attn: Tensor   # (B,)     [CASE] self-mass (diagnostic)
-    event_attn_raw: List[Tensor]  # per layer (B·T, H, 1+F, 1+F)
-    case_attn_raw: List[Tensor]   # per layer (B, H, 1+T, 1+T)
-```
-
-### 7.3 `XD2NetHier`
-```python
-class XD2NetHier(nn.Module):
-    def __init__(self, schema: TokenSchema, dim_static: int, exp_dim: int, max_len: int,
-                 cfg: Optional[HierModelConfig] = None): ...
-        # self.encoder = nn.ModuleDict({"tokenizer": FieldTokenizer, "event": EventLevelEncoder,
-        #                               "case": CaseLevelEncoder})
-        # self.theta_head = ThetaHead(d_model + dim_static, exp_dim, cfg.dense_1_mult)
-        # self.prediction_head = PredictionHead(exp_dim)
-
-    def forward(self, raw_input, raw_input_static, input_exp, lengths=None, return_attn=False):
-        """raw_input: packed (B,T,n_cat+n_num). Same positional signature as XD2Net.
-        return_attn=False → (thetas, act_output, alpha)    # Trainer/Explainer compatible
-        return_attn=True  → HierOutput"""
-```
-* `self.encoder` **must** hold every encoder parameter, because `Trainer._train_epoch` applies
-  L2 to `self.model.encoder.parameters()` (`xd2net/training/trainer.py:163`).
-* `self.prediction_head.linear` must keep this exact attribute path, because `Explainer`
-  reads `model.prediction_head.linear.weight`.
-* If `lengths is None`, treat every position as real (`pad_mask = None`).
-* Store `schema` and `cfg` on the module. Add `get_config() -> dict` (schema dict +
-  cfg asdict + dims) so that a checkpoint can be rebuilt; the script saves it as JSON next to the
-  checkpoints.
-
----
-
-## 8. Explainer — `xd2net/hierarchical/explainer.py`
-
-```python
-class HierExplainer(Explainer):
-    # inherits explain_loader(), global_explanation() unchanged (Level-2)
-    def get_temporal_attention(...) -> np.ndarray          # inherited; returns alpha (N,T)
-
-    def get_hierarchical_attention(self, raw_input, raw_input_static, input_exp, lengths)
-        -> Dict[str, np.ndarray]   # keys: alpha, beta, joint, evt_self_attn, case_self_attn
-
-    def explain_attention_loader(self, loader, caseids, schema: TokenSchema, bucket: str,
-                                 raw_num_values: Optional[np.ndarray] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Returns (df_cells, df_case_fields)."""
-
-    def global_attention(self, df_cells, by: str = "field") -> pd.DataFrame   # by ∈ {"field", "field_label"}
-```
-
-**`df_cells`** — one row per (case, real event, field):
-
-| Column | Description |
-|---|---|
-| CASEID | case id |
-| EVENT_POS | 0-based position in prefix |
-| FIELD | field name |
-| VALUE_LABEL | label for categorical fields (via `schema.index_to_label`); empty for numeric |
-| VALUE_NUM | model-space value for numeric fields; NaN for categorical |
-| VALUE_RAW | raw numeric value, if `raw_num_values` is given |
-| EVENT_ATTN | α[t] |
-| FEATURE_ATTN | β[t,f] |
-| JOINT_ATTN | α[t]·β[t,f] |
-| EVT_SELF_ATTN | [EVT] self-mass for event t |
-| BUCKET | bucket key |
-
-Padded events are **excluded** (not written as zero rows).
-
-**`df_case_fields`** — one row per (case, field): `CASEID, FIELD, CASE_FIELD_ATTN (Σ_t JOINT_ATTN),
-CASE_SELF_ATTN, BUCKET`.
-
-**`global_attention`** — mean of `CASE_FIELD_ATTN` per field (`by="field"`), or the mean over
-cases of Σ_{t: label=v} JOINT_ATTN per (field, label) (`by="field_label"`). Also report the
-number of cases containing each label. Sorted descending.
-
-Validation (raise `ValueError`): `len(caseids)` equals the number of rows produced by the loader.
-The loader must not shuffle (check `isinstance(loader.sampler, SequentialSampler)`, otherwise
-warn). The schema field count must equal `raw_input.shape[-1]`.
-
----
-
-## 9. Experiment script & notebook
-
-**`scripts/run_hier_experiment.py`**: mirrors `scripts/run_experiment.py`.
-* Imports and reuses `load_and_preprocess` and the logic of `process_bucket` from
-  `scripts/run_experiment.py`. Factor out a shared helper only if that can be done **without
-  editing** the baseline script; otherwise copy the bucket assembly and replace the one-hot
-  dynamic build with `build_dynamic_tokens`.
-* Per bucket: build `TokenSchema` → `XD2NetHier` → `Trainer` → `HierExplainer`. Write
-  `predictions_*.csv` and `explanations_*.csv` (Level-2, same format as the baseline), plus
-  `attention_cells_*.csv` and `attention_case_fields_*.csv`. Save `model_config_*.json`.
-* Writes `results.csv` under `outputs_hier/`, in the same schema as the baseline, for direct AUC
-  comparison.
-
-**`notebooks/05_hier_explain.ipynb`**: per-case T×F joint-attention heatmap with label
-annotations; α bar chart per case; global field and (field, label) attention bars; baseline vs.
-hierarchical AUC per bucket; diagnostics (self-mass distribution, attention entropy).
-
-**Optional faithfulness checks** (notebook section, not a hard requirement): deletion curve. Mask
-the top-k α events (set to PAD and mark padded) and the top-k β fields (zero the token) and plot
-the change in prediction against random masking. Also compute the correlation between β and
-|gradient × input| on the tokenizer output.
-
----
-
-## 10. Tests — `tests/hierarchical/` (pytest, CPU, tiny synthetic data)
-
-Fixture: a schema with 2 categorical fields (cards 5, 3) and 2 numeric fields; B=4, T=6, mixed
-lengths including 1 and T; `d_model=16, nhead=2`.
-
-| # | Test | File |
+| # | Issue in the original baseline code | Fix |
 |---|---|---|
-| 1 | `build_dynamic_tokens`: shift by +1, PAD only where t ≥ length, numeric passthrough, float exactness | test_data |
-| 2 | `TokenSchema` `to_dict`/`from_dict` round-trip; `index_to_label` maps back to original labels | test_data |
-| 3 | `AttnEncoderLayer` returns attn of shape (N,H,L,L), rows sum to 1 | test_layers |
-| 4 | Head-mean readout equals manual `attn.mean(1)` | test_layers |
-| 5 | `cls_readout("rollout")` == `cls_readout("last")` when there is 1 layer | test_layers |
-| 6 | Rollout rows sum to 1 for 3 layers | test_layers |
-| 7 | β sums to 1 over fields for every real event; β = 0 at pad events | test_model |
-| 8 | α sums to 1 over real events; α = 0 at padding | test_model |
-| 9 | joint sums to 1 per case | test_model |
-| 10 | **Mask invariance**: adding extra padded events (larger T, same lengths, arbitrary pad content) leaves `act_output`, α (real part), β (real part) unchanged (eval mode, atol 1e-5) | test_model |
-| 11 | Default `forward` returns a 3-tuple; `return_attn=True` returns `HierOutput` with the documented shapes | test_model |
-| 12 | Batch size 1 and `lengths=None` both work | test_model |
-| 13 | All encoder params are under `model.encoder` (param count of `model.encoder` + heads == total) | test_model |
-| 14 | `Trainer` runs 2 epochs on synthetic data with `XD2NetHier` without modification, and loss is finite | test_model |
-| 15 | `HierExplainer.explain_attention_loader`: row count = Σ lengths × F; labels correct; JOINT sums to 1 per case; raises on caseid mismatch | test_explainer |
-| 16 | Inherited `explain_loader` works and produces the baseline column schema | test_explainer |
+| 1 | `Trainer.__init__` passed `verbose=` to `ReduceLROnPlateau` (TypeError on current PyTorch) | Removed |
+| 2 | `Trainer` read `cfg.save_checkpoints` / `cfg.l2_reg`, which `TrainingConfig` lacked | Added to `TrainingConfig` with `seed`; `l2_reg` removed from the model config |
+| 3 | `RoleDiscovery.transform` failed on pandas ≥ 3; its inner `merge` dropped events with NaN resources; seen test resources were re-clustered from their test profile; unseen ones became their raw id (a new category) | Role map from train; seen resources keep their train role; NaN/unseen → `"none"`; no rows dropped; float ids normalised |
+| 4 | `load_and_preprocess` sorted by a hard-coded `"Complete Timestamp"` | Replaced by `load_event_log` (`event_order` per dataset) |
+| 5 | `build_exp_input` counted padded positions as category-0 occurrences | Generic builder masks by `lengths` |
+| 6 | The one-hot dynamic input set the category-0 bit at padded steps | `build_dynamic_onehot` zeroes padded rows |
+| 7 | `balance_dataset` was called with the positive label as "minority" | `balance_dataset` always uses the actual minority (a wrong hint logs a warning) |
+| 8 | Target names `A_DECLINED/A_APPROVED` hard-coded | Taken from `outcome.labels` |
+| 9 | `configs/bpic2012.yaml`, referenced by the README and notebooks, wasn't tracked | `configs/datasets/bpic2012.yaml` + `configs/models/baseline.yaml` |
+| 10 | `torch.load` without `weights_only`; every improving epoch left a checkpoint; with checkpoints off, `load_best_model` returned the last epoch | `weights_only=True`, single best file, in-memory best state |
+| 11 | Seeds not set; the training shuffle was unseeded | The runner seeds torch/numpy/random; `make_dataloaders` seeds the shuffle |
+| 12 | Exp feature names special-cased `ROLE` / `TIME_ELAPSED` | Generic names; `num_agg` per dataset (BPIC: `TIME_ELAPSED: max`) |
+| 13 | `pin_memory=True` on CPU-only machines (warning) | Enabled only with CUDA |
 
-Add `pytest` to a `[dev]` extra in `setup.cfg` only if the user approves editing it; otherwise
-document `pip install pytest`.
+Unchanged on purpose: the baseline architecture and parameter names (old `state_dict`s load
+strictly into `baseline.model.XD2Net`), and its L2 over all of `model.encoder`.
 
----
-
-## 11. Acceptance criteria
-
-1. All tests in §10 pass: `pytest tests/hierarchical -q`.
-2. `python scripts/run_hier_experiment.py --config configs/bpic2012_hier.yaml --buckets 1_10`
-   completes and writes `results.csv`, prediction/explanation CSVs and attention CSVs under
-   `outputs_hier/`.
-3. `git diff main -- xd2net/model xd2net/explain xd2net/training xd2net/data xd2net/config.py scripts/run_experiment.py`
-   is empty (baseline untouched).
-4. AUC for bucket 1_10 is reported next to the baseline. There is no hard threshold, but a drop
-   of more than 0.03 AUC should be investigated before the design is considered validated.
-5. The notebook renders at least one per-case joint heatmap with labelled categorical cells.
-
----
-
-## 12. Known baseline issues (record here; do not fix in this work)
-
-* `Trainer.__init__` and `_train_epoch` read `cfg.save_checkpoints`, but that field exists only
-  on `OutputConfig`, not on `TrainingConfig`. The script must work around this (e.g. by setting
-  the attribute on the `TrainingConfig` instance before constructing `Trainer`) or fix it
-  in a separate, approved change.
-* `ReduceLROnPlateau(verbose=...)` is deprecated in recent PyTorch and emits a warning.
-* README describes `configs/bpic2012.yaml`, but `configs/` is not tracked in git. The variant's
-  YAML must be added explicitly.
-
----
-
-## 13. Implementation order
-
-1. `data.py` + tests 1–2
-2. `layers.py` + tests 3–6
-3. `tokenizer.py`, `model.py` + tests 7–14
-4. `explainer.py` + tests 15–16
-5. `config.py`, YAML, `run_hier_experiment.py`; run bucket 1_10 end-to-end
-6. `05_hier_explain.ipynb`
+Because of fixes 3, 5 and 6, baseline results on BPIC are not bit-identical to the pre-restructure
+code. One example: 8,120 BPIC events with a missing resource now get `ROLE=none` instead of being
+clustered as a pseudo-resource.

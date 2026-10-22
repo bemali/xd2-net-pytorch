@@ -1,0 +1,27 @@
+# Model + training settings for the baseline XD2-Net (Transformer + TemporalAttentionPool).
+# Applied unchanged to every dataset passed to scripts/run_experiment.py --model baseline.
+
+model:
+  d_model: 140              # must be divisible by nhead
+  nhead: 4
+  num_encoder_layers: 1
+  dim_feedforward_mult: 4
+  dropout: 0.15
+  dense_1_mult: 1.5         # ThetaHead hidden size multiplier
+
+training:
+  optimizer: Adam
+  learning_rate: 0.01
+  batch_size: 256
+  epochs: 100
+  val_split: 0.15
+  early_stopping_patience: 10
+  lr_reduce_patience: 10
+  lr_reduce_factor: 0.5
+  lr_min: 1.0e-7
+  l2_reg: 0.0001            # L2 over every model.encoder parameter (original l2(0.0001))
+  save_checkpoints: true
+  seed: 42
+  device: auto              # auto | cpu | cuda | mps
+
+workspace_dir: ./outputs

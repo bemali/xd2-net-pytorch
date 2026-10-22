@@ -22,35 +22,49 @@ The explainability contract is unchanged: thetas are always non-negative, sum to
 
 ## Directory layout
 
+Two model variants sit side by side and share everything except the encoder that produces the
+Level-1 explanation:
+
+* **`baseline`**: Transformer encoder + external `TemporalAttentionPool` (`XD2Net`).
+* **`hierarchical`**: hierarchical self-attention, event → field and case → event (`XD2NetHier`).
+  See `docs/hierarchical_attention/`.
+
+Both packages have the same module set (`config`, `data/features`, `layers`, `model`, `training`,
+`explainer`, `spec`). Shared code lives in `xd2net/common`.
+
 ```
 xd2-net/
-├── xd2net/                    ← installable package
-│   ├── config.py              ← dataclasses + YAML loader
-│   ├── data/
-│   │   ├── preprocessing.py   ← data loading, encoding, vectorization
-│   │   ├── feature_engineering.py  ← build input_exp + feature names
-│   │   └── dataset.py         ← torch Dataset + DataLoader helpers
-│   ├── model/
-│   │   ├── encoder.py         ← InputProjection, EventEncoder,
-│   │   │                          TemporalAttentionPool, FeatureWeightingBlock
-│   │   ├── heads.py           ← ThetaHead, PredictionHead
-│   │   └── xd2net.py          ← top-level XD2Net nn.Module
-│   ├── training/
-│   │   ├── trainer.py         ← training loop, early stopping, LR scheduler
-│   │   └── metrics.py         ← AUC, F1, feature agreement
-│   └── explain/
-│       └── explainer.py       ← extract thetas + alpha → DataFrames
+├── xd2net/                       ← installable package
+│   ├── common/                   ← shared by every variant
+│   │   ├── config.py             ← TrainingConfig, DatasetConfig, ExperimentConfig, YAML loaders
+│   │   ├── data/
+│   │   │   ├── eventlog.py       ← load any event log (columns, order, outcome, time features)
+│   │   │   ├── preprocessing.py  ← split, role discovery, encoding, prefixes, vectorization
+│   │   │   ├── features.py       ← EventSchema, static input, explainable (exp) input
+│   │   │   ├── pipeline.py       ← prepare_dataset(), build_bucket(prepared, n, encoder)
+│   │   │   └── dataset.py        ← torch Dataset + DataLoader helpers
+│   │   ├── heads.py              ← ThetaHead, PredictionHead (Level-2)
+│   │   ├── masks.py              ← padding mask
+│   │   ├── metrics.py            ← AUC, F1, feature agreement
+│   │   ├── training.py           ← Trainer: early stopping, LR schedule, best checkpoint
+│   │   ├── explainer.py          ← Level-2 thetas + Level-1 attention-cell tables
+│   │   └── registry.py           ← ModelSpec, get_spec("baseline" | "hierarchical")
+│   ├── baseline/                 ← XD2Net
+│   │   ├── config.py  data/features.py (one-hot)  layers.py  model.py
+│   │   └── training.py  explainer.py  spec.py
+│   └── hierarchical/             ← XD2NetHier
+│       ├── config.py  data/features.py (field tokens)  layers.py  tokenizer.py  model.py
+│       └── training.py  explainer.py  spec.py
 ├── configs/
-│   └── bpic2012.yaml          ← BPIC 2012 default config
-├── notebooks/
-│   ├── 01_data_preparation.ipynb
-│   ├── 02_train.ipynb
-│   ├── 03_evaluate.ipynb
-│   └── 04_explain.ipynb
+│   ├── models/{baseline,hierarchical}.yaml   ← model + training settings per variant
+│   └── datasets/{bpic2012,_template}.yaml    ← one per event log, shared by both models
+├── notebooks/                    ← 01–04 take MODEL / DATASET_CONFIG; 05 = hierarchical attention
 ├── scripts/
-│   └── run_experiment.py      ← headless CLI
+│   └── run_experiment.py         ← headless CLI (one or more models × datasets)
+├── tests/                        ← pytest: common/, baseline/, hierarchical/, test_registry.py
+├── docs/
 ├── data/
-│   └── BPIC_2012_OUTCOME.csv  ← place dataset here
+│   └── BPIC_2012_OUTCOME.csv     ← place dataset here
 ├── setup.cfg
 ├── pyproject.toml
 └── requirements.txt
@@ -97,12 +111,16 @@ else:
 
 Run notebooks in this order:
 
+Set `MODEL` (`baseline` or `hierarchical`) and `DATASET_CONFIG` in the parameter cell of each
+notebook, then run them in this order. Paths below are under `outputs/<MODEL>/<dataset>/`.
+
 | Notebook | Purpose | Output |
 |---|---|---|
-| `01_data_preparation.ipynb` | Load CSV, split, encode, vectorize, save per-bucket artifacts | `outputs/artifacts/bucket_1_*.pkl` |
-| `02_train.ipynb` | Train one XD2Net per bucket, save checkpoints | `outputs/checkpoints/model_1_*.pt` |
-| `03_evaluate.ipynb` | Test metrics for XD2-Net + LR baseline | `outputs/results/comparison_results.csv` |
-| `04_explain.ipynb` | Extract thetas, alpha, feature agreement, effective complexity | `outputs/explanations/` |
+| `01_data_preparation.ipynb` | Load the log, split, encode, vectorize, save per-bucket artifacts | `artifacts/bucket_1_*.pkl` |
+| `02_train.ipynb` | Train one model per bucket, save the best checkpoint + config | `checkpoints/model_1_*.pt`, `model_config_1_*.json` |
+| `03_evaluate.ipynb` | Test metrics for XD2-Net + LR baseline | `results/comparison_results.csv` |
+| `04_explain.ipynb` | Extract thetas, alpha, feature agreement, effective complexity | `explanations/` |
+| `05_hier_explain.ipynb` | Hierarchical attention (α, β, α·β), reading `run_experiment.py` outputs | plots |
 
 ### 4. GPU acceleration (optional)
 
@@ -112,31 +130,48 @@ Colab's free T4 GPU works automatically. The config has `device: "auto"` which s
 
 ## Configuration
 
-Edit `configs/bpic2012.yaml` to change dataset paths, model size, or training schedule:
+Two kinds of YAML file are used:
+
+* **Model config:** `configs/models/<model>.yaml` holds the `model` and `training` settings for one
+  variant. It is applied unchanged to every dataset.
+* **Dataset config:** `configs/datasets/<name>.yaml` holds one event log's schema, outcome and
+  prefix settings. It is shared by both models. Copy `configs/datasets/_template.yaml` (fully
+  annotated) to add a log.
 
 ```yaml
-data:
-  csv_path: "data/BPIC_2012_OUTCOME.csv"
-  cat_dynamic: ["ACTIVITY", "ROLE"]
-  num_dynamic: ["TASK_DURATION", "TIME_ELAPSED"]
-  num_static:  ["AMOUNT_REQ"]
-  prefix_lengths: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+# configs/datasets/bpic2012.yaml (excerpt)
+name: bpic2012
+path: data/BPIC_2012_OUTCOME.csv
+columns: {caseid: CASEID, timestamp: END_TIMESTAMP, activity: MILESTONE, role: null, resource: RESOURCE}
+event_order: file                 # keep file order within each case
+event_num: [TASK_DURATION, TIME_ELAPSED]
+case_num: [AMOUNT_REQ]
+outcome: {mode: column, column: OUTCOME, positive: A_APPROVED, labels: [A_DECLINED, A_APPROVED]}
+prefix: {lengths: [5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]}
+```
 
+```yaml
+# configs/models/baseline.yaml (excerpt)
 model:
   d_model: 140        # 2×70 — matches original BiLSTM hidden size
   nhead: 4
   num_encoder_layers: 1
   dropout: 0.15
-
 training:
   learning_rate: 0.01
   batch_size: 256
   epochs: 100
   early_stopping_patience: 10
+  l2_reg: 0.0001
+  seed: 42
   device: "auto"      # auto | cpu | cuda | mps
 ```
 
-To use a different event log, create a new YAML file and point `csv_path` at your CSV. The expected columns are controlled by the `caseid_col`, `activity_col`, and `outcome_col` fields. Your CSV needs a timestamp column for event ordering and a resource column (`RESOURCE`) for role discovery.
+Any event log works if it has a case id, a timestamp (or a meaningful file order) and an
+activity, plus either a role column or a resource column for role discovery. Each extra variable
+is declared as case-level or event-level, categorical or numeric. The outcome is either a column
+or "the case contains one of these activities"; in the activity mode, prefixes are cut before the
+first target activity so the label can't leak.
 
 ---
 
@@ -144,11 +179,21 @@ To use a different event log, create a new YAML file and point `csv_path` at you
 
 ```bash
 pip install -e .
-python scripts/run_experiment.py --config configs/bpic2012.yaml
 
-# Train only specific buckets
-python scripts/run_experiment.py --config configs/bpic2012.yaml --buckets 1_10 1_15
+# Both models on BPIC 2012, all buckets
+python scripts/run_experiment.py --model baseline hierarchical --datasets configs/datasets/bpic2012.yaml
+
+# One model, several logs, selected buckets
+python scripts/run_experiment.py --model hierarchical \
+    --datasets configs/datasets/bpic2012.yaml configs/datasets/my_log.yaml --buckets 1_10 1_15
 ```
+
+Each dataset is prepared once and shared by every model, so they see the same split and
+prefixes. The outputs go to `outputs/<model>/<dataset>/`, and the combined
+`outputs/results_all.csv` has one row per (model, dataset, bucket). Other options:
+`--model-config` (one per model), `--seed`, `--epochs`, `--workspace` and `--fail-fast`.
+
+Run the tests with `pytest tests -q`.
 
 ---
 
@@ -171,7 +216,11 @@ New:
 
 The context vector assembly formula is byte-for-byte identical to the original, preserving the mathematical meaning of both explainability levels.
 
-### Level-1: TemporalAttentionPool
+This is the `baseline` variant. The `hierarchical` variant replaces the encoder and both pooling
+blocks with two levels of self-attention (field tokens → `[EVT]`, event representations → `[CASE]`)
+and reads α and β from their attention rows. See `docs/hierarchical_attention/APPROACH.md`.
+
+### Level-1 (baseline): TemporalAttentionPool
 
 Single-head cross-attention with one learned query vector attending over the encoder output. Produces `alpha_weights (B, T)` — softmax over non-padded positions. Directly analogous to the original `Softmax(axis=1)` on the alpha BiLSTM output.
 
@@ -202,6 +251,15 @@ CASEID | FEATURE | FEATURE_VALUE | FEATURE_IMPORTANCE | BUCKET
 `FEATURE_IMPORTANCE = theta_i × final_layer_weight_i`
 
 **`alpha_weights`** (N × T numpy array): event-level attention for temporal heatmaps.
+
+**`attention_cells`** (per case × real event × field, long format), the same schema for both models:
+```
+CASEID | EVENT_POS | EVENT_INDEX | EVENT_ACTIVITY | EVENT_ROLE | FIELD | VALUE_LABEL | VALUE_NUM |
+EVENT_ATTN | FEATURE_ATTN | JOINT_ATTN | EVT_SELF_ATTN | BUCKET
+```
+`EVENT_POS` 0 is the most recent event; `EVENT_INDEX` 0 is the first. `EVENT_ATTN` is α. The
+baseline has no per-field attention, so its `FEATURE_ATTN` / `JOINT_ATTN` / `EVT_SELF_ATTN` are NaN.
+The hierarchical model fills them with β, α·β and the `[EVT]` self-mass.
 
 ---
 

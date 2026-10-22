@@ -1,0 +1,30 @@
+# Model + training settings for the hierarchical self-attention XD2-Net (XD2NetHier).
+# Applied unchanged to every dataset passed to scripts/run_experiment.py --model hierarchical.
+
+model:
+  d_model: 64               # token / representation width (must be divisible by nhead)
+  nhead: 4                  # explanations average attention over heads
+  event_layers: 1           # Level A depth (1 = direct CLS readout)
+  case_layers: 1            # Level B depth
+  dim_feedforward_mult: 4
+  dropout: 0.15
+  attn_readout: rollout     # rollout | last  (identical when layers == 1)
+  cls_self_attend: false    # false: [EVT]/[CASE] cannot attend to themselves
+  dense_1_mult: 1.5         # ThetaHead hidden size multiplier
+
+training:
+  optimizer: Adam
+  learning_rate: 0.01
+  batch_size: 256
+  epochs: 100
+  val_split: 0.15
+  early_stopping_patience: 10
+  lr_reduce_patience: 10
+  lr_reduce_factor: 0.5
+  lr_min: 1.0e-7
+  l2_reg: 0.0001            # HierTrainer excludes attention Q/K, LayerNorm and biases
+  save_checkpoints: true
+  seed: 42
+  device: auto              # auto | cpu | cuda | mps
+
+workspace_dir: ./outputs

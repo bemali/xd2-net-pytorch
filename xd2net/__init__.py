@@ -1,6 +1,13 @@
-"""XD2-Net: Inherently Explainable Process Outcome Prediction."""
+"""XD2-Net: Inherently Explainable Process Outcome Prediction.
 
-from xd2net.config import XD2Config, load_config, save_config
-from xd2net.model.xd2net import XD2Net
+Packages:
+    xd2net.common        shared configs, data pipeline, heads, trainer, explainer, registry
+    xd2net.baseline      Transformer + TemporalAttentionPool (XD2Net)
+    xd2net.hierarchical  hierarchical self-attention (XD2NetHier)
+"""
 
-__all__ = ["XD2Config", "load_config", "save_config", "XD2Net"]
+from xd2net.baseline.model import XD2Net
+from xd2net.common.registry import available_models, get_spec
+from xd2net.hierarchical.model import XD2NetHier
+
+__all__ = ["XD2Net", "XD2NetHier", "available_models", "get_spec"]
