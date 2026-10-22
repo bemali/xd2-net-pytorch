@@ -10,9 +10,12 @@ Usage:
         --model baseline hierarchical \
         --datasets configs/datasets/bpic2012.yaml configs/datasets/my_log.yaml \
         [--model-config configs/models/baseline.yaml configs/models/hierarchical.yaml] \
-        [--buckets 1_5 1_10] [--seed 42] [--epochs 5] [--workspace ./outputs] [--fail-fast]
+        [--buckets 1_5 1_10] [--seed 42] [--epochs 5] [--batch-size 512] [--amp | --no-amp]
+        [--device cuda] [--workspace ./outputs] [--skip-existing] [--fail-fast]
 
 ``--model-config`` defaults to ``configs/models/<model>.yaml`` for each model.
+``--skip-existing`` resumes an interrupted run (e.g. a Colab disconnect): buckets whose
+results row, model config and explanation files already exist are not retrained.
 
 Outputs, under <workspace>/<model>/<dataset>/:
     dataset_config.yaml, experiment_config.yaml, dataset_summary.json
@@ -54,6 +57,7 @@ from xd2net.common.config import (
 )
 from xd2net.common.data import build_bucket, make_dataloaders, make_test_loader, prepare_dataset, resolve_prefix_lengths
 from xd2net.common.data.pipeline import PreparedLog
+from xd2net.common.device import accelerated, amp_dtype, resolve_device
 from xd2net.common.metrics import evaluate_predictions
 from xd2net.common.registry import ModelSpec, available_models, get_spec
 
@@ -79,12 +83,15 @@ def run_bucket(spec: ModelSpec, exp: ExperimentConfig, ds: DatasetConfig, bucket
     seed_everything(tcfg.seed)
 
     model = spec.build_model(bucket, exp.model, ds.name)
+    device = resolve_device(tcfg.device)
+    data_device = device if (tcfg.data_on_device and accelerated(device)) else None
     train_loader, val_loader = make_dataloaders(
         bucket["inputs_train"], bucket["outputs_train"], bucket["lengths_train"],
-        val_split=tcfg.val_split, batch_size=tcfg.batch_size, seed=tcfg.seed,
+        val_split=tcfg.val_split, batch_size=tcfg.batch_size, seed=tcfg.seed, device=data_device,
     )
     test_loader = make_test_loader(
         bucket["inputs_test"], bucket["outputs_test"], bucket["lengths_test"], batch_size=tcfg.batch_size,
+        device=data_device,
     )
 
     ckpt_dir = os.path.join(out_dir, "checkpoints")
@@ -127,10 +134,39 @@ def run_bucket(spec: ModelSpec, exp: ExperimentConfig, ds: DatasetConfig, bucket
     return row
 
 
+def _completed(out_dir: str) -> dict:
+    """bucket -> results row, for buckets whose outputs are all present in ``out_dir``."""
+    path = os.path.join(out_dir, "results.csv")
+    if not os.path.exists(path):
+        return {}
+    done = {}
+    for row in pd.read_csv(path).to_dict("records"):
+        key = row["bucket"]
+        needed = [
+            os.path.join(out_dir, "checkpoints", f"model_config_{key}.json"),
+            os.path.join(out_dir, "explanations", f"predictions_{key}.csv"),
+            os.path.join(out_dir, "explanations", f"explanations_{key}.csv"),
+            os.path.join(out_dir, "explanations", f"attention_cells_{key}.csv"),
+        ]
+        if all(os.path.exists(f) for f in needed):
+            done[key] = row
+    return done
+
+
 def run_dataset(
-    models: List[tuple], ds: DatasetConfig, workspace: str, seed: int, buckets: Optional[List[str]]
+    models: List[tuple], ds: DatasetConfig, workspace: str, seed: int, buckets: Optional[List[str]],
+    skip_existing: bool = False,
 ) -> List[dict]:
-    """Prepare ``ds`` once, then train/explain every model on every bucket."""
+    """Prepare ``ds`` once, then train/explain every model on every bucket.
+
+    With ``skip_existing``, buckets already completed for a model (see ``_completed``)
+    are reported from their saved results row instead of being retrained.
+    """
+    done = {}
+    if skip_existing:
+        for spec, _ in models:
+            for key, row in _completed(os.path.join(workspace, spec.name, ds.name)).items():
+                done[(spec.name, key)] = row
     prepared: PreparedLog = prepare_dataset(ds, seed=seed)
     prefix_lengths = resolve_prefix_lengths(prepared)
     summary = {**prepared.summary(), "prefix_lengths": prefix_lengths}
@@ -152,6 +188,11 @@ def run_dataset(
         if buckets and key not in buckets:
             continue
         for spec, exp in models:
+            if (spec.name, key) in done:
+                logger.info("[%s/%s] bucket %s: already done, skipping (--skip-existing).",
+                            spec.name, ds.name, key)
+                rows.append(done[(spec.name, key)])
+                continue
             bucket = build_bucket(prepared, n, spec.encode_dynamic, seed=exp.training.seed)
             if bucket is None:
                 break           # skipping is a property of the data, the same for every model
@@ -171,7 +212,13 @@ def main():
     ap.add_argument("--buckets", nargs="*", help="Subset of buckets, e.g. 1_5 1_10")
     ap.add_argument("--seed", type=int, help="Override training.seed (also used for the data split)")
     ap.add_argument("--epochs", type=int, help="Override training.epochs")
+    ap.add_argument("--batch-size", type=int, help="Override training.batch_size")
+    ap.add_argument("--amp", action=argparse.BooleanOptionalAction, default=None,
+                    help="Override training.amp (mixed precision)")
+    ap.add_argument("--device", help="Override training.device (auto | cpu | cuda | mps)")
     ap.add_argument("--workspace", help="Override workspace_dir")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="Resume: skip buckets whose outputs already exist in the workspace")
     ap.add_argument("--fail-fast", action="store_true", help="Stop at the first failing dataset")
     args = ap.parse_args()
 
@@ -183,7 +230,9 @@ def main():
     for name, path in zip(args.model, config_paths):
         spec = get_spec(name)
         exp = load_experiment_config(path or str(REPO_ROOT / spec.default_config), spec.model_config_cls)
-        overrides = {k: v for k, v in (("seed", args.seed), ("epochs", args.epochs)) if v is not None}
+        overrides = {k: v for k, v in (("seed", args.seed), ("epochs", args.epochs),
+                                       ("batch_size", args.batch_size), ("amp", args.amp),
+                                       ("device", args.device)) if v is not None}
         if overrides:
             exp.training = dataclasses.replace(exp.training, **overrides)
         models.append((spec, exp))
@@ -194,13 +243,23 @@ def main():
     os.makedirs(workspace, exist_ok=True)
     seed = models[0][1].training.seed
 
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    for spec, exp in models:
+        device = resolve_device(exp.training.device)
+        gpu = f" ({torch.cuda.get_device_name(device)})" if device.type == "cuda" else ""
+        logger.info("[%s] device=%s%s amp=%s batch_size=%d data_on_device=%s", spec.name, device, gpu,
+                    amp_dtype(device) if exp.training.amp else None, exp.training.batch_size,
+                    exp.training.data_on_device and accelerated(device))
+
     all_rows, failed = [], []
     for path in args.datasets:
         try:
             ds = load_dataset_config(path)
             logger.info("=" * 70)
             logger.info("Dataset %s (%s)", ds.name, path)
-            all_rows.extend(run_dataset(models, ds, workspace, seed, args.buckets))
+            all_rows.extend(run_dataset(models, ds, workspace, seed, args.buckets, args.skip_existing))
         except Exception:
             logger.exception("Dataset %s failed", path)
             failed.append(path)

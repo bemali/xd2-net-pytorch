@@ -20,18 +20,9 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 
 from xd2net.common.config import TrainingConfig
+from xd2net.common.device import amp_dtype, resolve_device
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_device(device_str: str) -> torch.device:
-    if device_str == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    return torch.device(device_str)
 
 
 def _build_optimizer(
@@ -74,7 +65,11 @@ class Trainer:
         self.cfg = cfg
         self.output_dir = output_dir
         self.bucket = bucket
-        self.device = _resolve_device(cfg.device)
+        self.device = resolve_device(cfg.device)
+
+        # Mixed precision: autocast the forward pass; the loss is computed in fp32.
+        self.amp_dtype = amp_dtype(self.device) if cfg.amp else None
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_dtype == torch.float16)
 
         self.model = model.to(self.device)
         self.optimizer = _build_optimizer(self.model, cfg)
@@ -159,23 +154,29 @@ class Trainer:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _autocast(self):
+        return torch.autocast(self.device.type, dtype=self.amp_dtype, enabled=self.amp_dtype is not None)
+
     def _train_epoch(self, loader: DataLoader) -> float:
         self.model.train()
-        total_loss = 0.0
+        total_loss = torch.zeros((), device=self.device)
         for batch in loader:
             raw_input, raw_input_static, input_exp, labels, lengths = self._to_device(batch)
 
             self.optimizer.zero_grad()
-            thetas, act_output, _ = self.model(raw_input, raw_input_static, input_exp, lengths)
+            with self._autocast():
+                thetas, act_output, _ = self.model(raw_input, raw_input_static, input_exp, lengths)
 
-            bce = F.binary_cross_entropy(act_output, labels)
+            # binary_cross_entropy is not autocast-safe: compute the loss in fp32.
+            bce = F.binary_cross_entropy(act_output.float(), labels)
             loss = bce + self.cfg.l2_reg * self._l2_penalty()
 
-            loss.backward()
-            self.optimizer.step()
-            total_loss += loss.item()
+            self.scaler.scale(loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+            total_loss += loss.detach()
 
-        return total_loss / max(len(loader), 1)
+        return total_loss.item() / max(len(loader), 1)
 
     def _l2_penalty(self) -> Tensor:
         """Sum of squares over all encoder parameters (matches the original l2(0.0001))."""
@@ -190,18 +191,19 @@ class Trainer:
         with torch.no_grad():
             for batch in loader:
                 raw_input, raw_input_static, input_exp, labels, lengths = self._to_device(batch)
-                thetas, act_output, _ = self.model(
-                    raw_input, raw_input_static, input_exp, lengths
-                )
-                bce = F.binary_cross_entropy(act_output, labels)
-                total_loss += bce.item()
-                all_labels.append(labels.cpu())
-                all_probs.append(act_output.cpu())
+                with self._autocast():
+                    thetas, act_output, _ = self.model(
+                        raw_input, raw_input_static, input_exp, lengths
+                    )
+                act_output = act_output.float()
+                total_loss += F.binary_cross_entropy(act_output, labels)
+                all_labels.append(labels)
+                all_probs.append(act_output)
 
-        y_true = torch.cat(all_labels).numpy()
-        y_prob = torch.cat(all_probs).numpy()
+        y_true = torch.cat(all_labels).cpu().numpy()
+        y_prob = torch.cat(all_probs).cpu().numpy()
 
-        val_loss = total_loss / max(len(loader), 1)
+        val_loss = float(total_loss) / max(len(loader), 1)
         try:
             from sklearn.metrics import roc_auc_score
             val_auc = roc_auc_score(y_true, y_prob)
@@ -221,4 +223,4 @@ class Trainer:
         logger.debug("Checkpoint saved: %s", fname)
 
     def _to_device(self, batch: Tuple) -> Tuple:
-        return tuple(t.to(self.device) for t in batch)
+        return tuple(t.to(self.device, non_blocking=True) for t in batch)

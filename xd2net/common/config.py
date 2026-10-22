@@ -39,6 +39,8 @@ class TrainingConfig:
     save_checkpoints: bool = True
     seed: int = 42
     device: str = "auto"
+    amp: bool = False               # mixed precision (bf16 where supported, else fp16 + GradScaler)
+    data_on_device: bool = True     # keep bucket tensors on the GPU (ignored on CPU)
 
 
 @dataclass

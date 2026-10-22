@@ -187,15 +187,15 @@ class Explainer:
         schema = getattr(self.model, "schema", None)
         if schema is None:
             raise ValueError("The model has no EventSchema; build it with schema=bucket['event_schema'].")
-        if not isinstance(loader.sampler, SequentialSampler):
+        if not isinstance(getattr(loader, "sampler", None), SequentialSampler):
             warnings.warn("Loader is not sequential; rows may not align with caseids.", stacklevel=2)
 
         acc: Dict[str, list] = {"raw": [], "lengths": []}
         for raw_input, raw_input_static, input_exp, _y, lengths in loader:
             for k, v in self._attention_batch(raw_input, raw_input_static, input_exp, lengths).items():
                 acc.setdefault(k, []).append(v)
-            acc["raw"].append(raw_input.numpy())
-            acc["lengths"].append(lengths.numpy())
+            acc["raw"].append(raw_input.cpu().numpy())
+            acc["lengths"].append(lengths.cpu().numpy())
         data = {k: (None if any(x is None for x in v) else np.concatenate(v)) for k, v in acc.items()}
 
         alpha, lengths = data["alpha"], data["lengths"]

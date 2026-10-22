@@ -23,5 +23,7 @@ training:
   save_checkpoints: true
   seed: 42
   device: auto              # auto | cpu | cuda | mps
+  amp: false                # mixed precision on GPU (bf16 if supported, else fp16); --amp in the runner
+  data_on_device: true      # keep bucket tensors on the GPU (no effect on CPU)
 
 workspace_dir: ./outputs
